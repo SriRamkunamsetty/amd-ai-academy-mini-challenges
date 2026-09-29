@@ -1,0 +1,121 @@
+name: CI MC2 OCR
+
+on:
+  push:
+    branches: [main]
+    paths: ['mc2-ocr/**', '.github/workflows/ci-mc2-ocr.yml']
+  pull_request:
+    branches: [main]
+    paths: ['mc2-ocr/**', '.github/workflows/ci-mc2-ocr.yml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-type-test:
+    name: lint, type-check, test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mc2-ocr
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: mc2-ocr/pyproject.toml
+
+      - name: Install package with dev extras
+        run: python -m pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: ruff check src tests scripts app.py
+
+      - name: Ruff (format check)
+        run: ruff format --check src tests scripts app.py
+
+      - name: mypy (strict)
+        run: mypy
+
+      - name: pytest with coverage
+        run: pytest -q --cov=tabula_ocr --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: mc2-ocr/coverage.xml
+          retention-days: 14
+
+      - name: Offline demo (no GPU) smoke test
+        run: |
+          TABULA_SCHEMA_DIR=schemas python -m tabula_ocr.cli demo | tee demo.out
+          grep -q "HOLD" demo.out   # the abstention path must actually fire
+
+      - name: Contract-mode self-check (real subprocesses, real HTTP, scripted model)
+        run: python scripts/contract_selfcheck.py   # exits non-zero unless it scores full marks in time
+
+  harness-benchmark:
+    name: pipeline overhead benchmark (no GPU)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mc2-ocr
+    needs: lint-type-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: mc2-ocr/pyproject.toml
+      - run: python -m pip install -e .
+      - name: Run harness-only benchmark
+        run: |
+          TABULA_SCHEMA_DIR=schemas python benchmarks/bench_pipeline.py \
+            --requests 40 --concurrency 8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: mc2-ocr/benchmarks/results.json
+          retention-days: 30
+
+  submission-dockerfile-lint:
+    name: lint the submission Dockerfile
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mc2-ocr
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: mc2-ocr/Dockerfile.submission
+          failure-threshold: error
+
+  docker-build:
+    name: build container image
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mc2-ocr
+    needs: lint-type-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: mc2-ocr
+          push: false
+          tags: tabula-ocr:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
